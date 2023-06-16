@@ -11,6 +11,7 @@ import torch
 import torch.backends.cudnn as cudnn
 import torch.nn as nn
 import torch.nn.parallel
+import torch.nn.functional as F
 import torch.optim
 import torch.utils.data
 import torch.multiprocessing as mp
@@ -29,7 +30,17 @@ from util.logger import get_logger
 from functools import partial
 from util.lr import MultiStepWithWarmup, PolyLR, PolyLRwithWarmup
 import torch_points_kernels as tp
+from util.common_util import get_aupr_auroc
 
+from loss.pseudo import (
+    get_pseudo_label,
+    get_pseudo_label_msp,
+    get_pseudo_mask,
+    get_pseudo_mask_from_prototypes,
+)
+
+import  warnings
+warnings.filterwarnings("ignore")
 
 def get_parser():
     parser = argparse.ArgumentParser(description='PyTorch Point Cloud Semantic Segmentation')
@@ -90,7 +101,7 @@ def main():
 
 
 def main_worker(gpu, ngpus_per_node, argss):
-    global args, best_iou
+    global args, best_iou, optimizer
     args, best_iou = argss, 0
     if args.distributed:
         if args.dist_url == "env://" and args.rank == -1:
@@ -337,16 +348,23 @@ def main_worker(gpu, ngpus_per_node, argss):
             writer.add_scalar('mIoU_train', mIoU_train, epoch_log)
             writer.add_scalar('mAcc_train', mAcc_train, epoch_log)
             writer.add_scalar('allAcc_train', allAcc_train, epoch_log)
-
+            # writer.add_scalar("aupr_batch_mean_train", others_train["aupr"], epoch_log)
+            # writer.add_scalar(
+            #     "auroc_batch_mean_train", others_train["auroc"], epoch_log
+            # )
         is_best = False
         if args.evaluate and (epoch_log % args.eval_freq == 0):
-            loss_val, mIoU_val, mAcc_val, allAcc_val = validate(val_loader, model, criterion)
+            loss_val, mIoU_val, mAcc_val, allAcc_val, aupr, auroc= validate(val_loader, model, criterion)
 
             if main_process():
                 writer.add_scalar('loss_val', loss_val, epoch_log)
                 writer.add_scalar('mIoU_val', mIoU_val, epoch_log)
                 writer.add_scalar('mAcc_val', mAcc_val, epoch_log)
                 writer.add_scalar('allAcc_val', allAcc_val, epoch_log)
+                writer.add_scalar("aupr_batch_mean_val", aupr, epoch_log)
+                writer.add_scalar(
+                    "auroc_batch_mean_val", auroc, epoch_log
+                )
                 is_best = mIoU_val > best_iou
                 best_iou = max(best_iou, mIoU_val)
 
@@ -372,12 +390,17 @@ def train(train_loader, model, criterion, optimizer, epoch, scaler, scheduler):
     intersection_meter = AverageMeter()
     union_meter = AverageMeter()
     target_meter = AverageMeter()
+
+    aupr_meter = AverageMeter()
+    auroc_meter = AverageMeter()
     model.train()
     end = time.time()
     max_iter = args.epochs * len(train_loader)
     for i, (coord, feat, target, offset) in enumerate(train_loader):  # (n, 3), (n, c), (n), (b)
         data_time.update(time.time() - end)
-
+    # for i, (coord, feat, target, offset, new_coord, new_feat, new_target, new_offset, new_label_ori) in enumerate(
+    #         train_loader
+    # ):  # (n, 3), (n, c), (n), (b)
         offset_ = offset.clone()
         offset_[1:] = offset_[1:] - offset_[:-1]
         batch = torch.cat([torch.tensor([ii] * o) for ii, o in enumerate(offset_)], 0).long()
@@ -394,16 +417,39 @@ def train(train_loader, model, criterion, optimizer, epoch, scaler, scheduler):
         neighbor_idx = neighbor_idx.cuda(non_blocking=True)
         assert batch.shape[0] == feat.shape[0]
 
+        # generate unknown
+        target_id = target.clone()
+        target_id[
+            torch.isin(
+                target_id, torch.tensor(args.unknown_label, device=target_id.device)
+            )
+        ] = -100
+        #
+        assert not torch.isin(
+            target_id, torch.tensor(args.unknown_label, device=target_id.device)
+        ).any()
+
         if args.concat_xyz:
             feat = torch.cat([feat, coord], 1)
 
         use_amp = args.use_amp
         with torch.cuda.amp.autocast(enabled=use_amp):
+            # output, unknown_pred = model(feat, coord, offset, batch, neighbor_idx)
             output = model(feat, coord, offset, batch, neighbor_idx)
             assert output.shape[1] == args.classes
             if target.shape[-1] == 1:
                 target = target[:, 0]  # for cls
-            loss = criterion(output, target)
+
+            # # before loss
+            # pseudo_mask = get_pseudo_label_msp(output)
+            # target_loss = target_id.clone()
+            # target_loss[pseudo_mask] = 20
+            #
+            # output = torch.cat([output, unknown_pred], -1)  # pseudo label
+            #
+            # loss = criterion(output, target_loss)
+
+            loss = criterion(output, target_id)
 
         optimizer.zero_grad()
 
@@ -418,6 +464,7 @@ def train(train_loader, model, criterion, optimizer, epoch, scaler, scheduler):
         if args.scheduler_update == 'step':
             scheduler.step()
 
+        output = output[:, :20]  # split pseudo label # 好像没用？
         output = output.max(1)[1]
         n = coord.size(0)
         if args.multiprocessing_distributed:
@@ -426,7 +473,25 @@ def train(train_loader, model, criterion, optimizer, epoch, scaler, scheduler):
             dist.all_reduce(loss), dist.all_reduce(count)
             n = count.item()
             loss /= n
-        intersection, union, target = intersectionAndUnionGPU(output, target, args.classes, args.ignore_label)
+
+        # # get aupr and auroc
+        # aupr, auroc = get_aupr_auroc(
+        #     unknown_pred,
+        #     target,
+        #     args.unknown_label,
+        #     args.ignore_label,
+        #     logger if main_process() else None,
+        #     distributed=args.distributed,
+        #     main_process=main_process(),
+        # )
+        #
+        # if aupr > 0 and auroc > 0:
+        #     aupr_meter.update(aupr)
+        #     auroc_meter.update(auroc)
+        # elif main_process():
+        #     logger.warning("This batch does not contain any OOD pixels or is only OOD.")
+
+        intersection, union, target = intersectionAndUnionGPU(output, target_id, args.classes, args.ignore_label)
         if args.multiprocessing_distributed:
             dist.all_reduce(intersection), dist.all_reduce(union), dist.all_reduce(target)
         intersection, union, target = intersection.cpu().numpy(), union.cpu().numpy(), target.cpu().numpy()
@@ -491,6 +556,9 @@ def validate(val_loader, model, criterion):
     union_meter = AverageMeter()
     target_meter = AverageMeter()
 
+    aupr_meter = AverageMeter()
+    auroc_meter = AverageMeter()
+
     torch.cuda.empty_cache()
 
     model.eval()
@@ -514,6 +582,18 @@ def validate(val_loader, model, criterion):
         neighbor_idx = neighbor_idx.cuda(non_blocking=True)
         assert batch.shape[0] == feat.shape[0]
 
+        #generate target_id
+        target_id = target.clone().detach()
+        # target_ori_list.append(target_id)
+        target_id[
+            torch.isin(
+                target, torch.tensor(args.unknown_label, device=target_id.device)
+            )
+        ] = args.ignore_label
+        assert not torch.isin(
+            target_id, torch.tensor(args.unknown_label, device=target_id.device)
+        ).any()
+
         if target.shape[-1] == 1:
             target = target[:, 0]  # for cls
 
@@ -521,10 +601,46 @@ def validate(val_loader, model, criterion):
             feat = torch.cat([feat, coord], 1)
 
         with torch.no_grad():
-            output = model(feat, coord, offset, batch, neighbor_idx)
-            loss = criterion(output, target)
+            output = model(feat, coord, offset, batch, neighbor_idx) # label or logits? : output is logits
+            # CrossEntropyLoss has softmax inside
+            loss = criterion(output, target_id)
 
+        unknown_pred = get_pseudo_label_msp(output)
+
+        aupr, auroc = get_aupr_auroc(
+            unknown_pred,
+            target,
+            args.unknown_label,
+            args.ignore_label,
+            logger if main_process() else None,
+            distributed=args.distributed,
+            main_process=main_process(),
+        )
+        if aupr > 0 and auroc > 0:
+            aupr_meter.update(aupr)
+            auroc_meter.update(auroc)
+        elif main_process():
+            logger.warning("This batch does not contain any OOD pixels or is only OOD.")
+        # # Compute MSP
+        # if args.msp:
+        #     msp = F.softmax(output, dim=1)
+        #     msp = msp.max(1)[0]
+        #     msp = msp.view(-1, args.num_classes)
+        #     msp = msp.cpu().numpy()
+        #     if i == 0:
+        #         msp_meter = AverageMeter()
+        #         msp_meter.update(msp)
+        #     else:
+        #         msp_meter.update(msp)
+        # else:
+        #     msp_meter = None
+        # output = output.max(1)[1]
+        # # get aupr and auroc
+        # aupr, auroc = get_aupr_auroc()
+
+        output = output[:, :20]  # pseudo label
         output = output.max(1)[1]
+
         n = coord.size(0)
         if args.multiprocessing_distributed:
             loss *= n
@@ -544,15 +660,26 @@ def validate(val_loader, model, criterion):
         batch_time.update(time.time() - end)
         end = time.time()
         if (i + 1) % args.print_freq == 0 and main_process():
-            logger.info('Test: [{}/{}] '
-                        'Data {data_time.val:.3f} ({data_time.avg:.3f}) '
-                        'Batch {batch_time.val:.3f} ({batch_time.avg:.3f}) '
-                        'Loss {loss_meter.val:.4f} ({loss_meter.avg:.4f}) '
-                        'Accuracy {accuracy:.4f}.'.format(i + 1, len(val_loader),
-                                                          data_time=data_time,
-                                                          batch_time=batch_time,
-                                                          loss_meter=loss_meter,
-                                                          accuracy=accuracy))
+            logger.info(
+                "Test: [{}/{}] "
+                "Data {data_time.val:.3f} ({data_time.avg:.3f}) "
+                "Batch {batch_time.val:.3f} ({batch_time.avg:.3f}) "
+                "Loss {loss_meter.val:.4f} ({loss_meter.avg:.4f}) "
+                "Accuracy {accuracy:.4f}. "
+                "aupr {aupr:.4f} ({aupr_meter.avg:.4f}) "
+                "auroc {auroc:.4f} ({auroc_meter.avg:.4f})".format(
+                    i + 1,
+                    len(val_loader),
+                    data_time=data_time,
+                    batch_time=batch_time,
+                    loss_meter=loss_meter,
+                    accuracy=accuracy,
+                    aupr=aupr,
+                    aupr_meter=aupr_meter,
+                    auroc=auroc,
+                    auroc_meter=auroc_meter,
+                )
+            )
 
     iou_class = intersection_meter.sum / (union_meter.sum + 1e-10)
     accuracy_class = intersection_meter.sum / (target_meter.sum + 1e-10)
@@ -565,7 +692,7 @@ def validate(val_loader, model, criterion):
             logger.info('Class_{} Result: iou/accuracy {:.4f}/{:.4f}.'.format(i, iou_class[i], accuracy_class[i]))
         logger.info('<<<<<<<<<<<<<<<<< End Evaluation <<<<<<<<<<<<<<<<<')
 
-    return loss_meter.avg, mIoU, mAcc, allAcc
+    return loss_meter.avg, mIoU, mAcc, allAcc, aupr_meter.avg, auroc_meter.avg
 
 
 if __name__ == '__main__':

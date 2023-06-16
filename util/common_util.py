@@ -8,6 +8,8 @@ from torch.nn.modules.conv import _ConvNd
 from torch.nn.modules.batchnorm import _BatchNorm
 import torch.nn.init as initer
 import torch.nn.functional as F
+import sklearn.metrics as sk
+import torch.distributed as dist
 
 
 class AverageMeter(object):
@@ -183,3 +185,57 @@ def smooth_loss(output, target, eps=0.1):
     log_prob = F.log_softmax(output, dim=1)
     loss = (-w * log_prob).sum(dim=1).mean()
     return loss
+
+
+def get_aupr_auroc(
+    unknown_pred,
+    target,
+    unknown_label,
+    ignore_label,
+    logger,
+    distributed=False,
+    main_process=False,
+):
+    valid = target != ignore_label
+    target = target[valid]
+    unknown_pred = unknown_pred.reshape(-1)[valid]
+
+    ood_labels = torch.isin(target, torch.tensor(unknown_label, device=target.device))
+
+    in_pred = unknown_pred[~ood_labels]
+    out_pred = unknown_pred[ood_labels]
+
+    if (len(in_pred) == 0) or (len(out_pred) == 0):
+        aupr, auroc = -2, -2
+    else:
+        examples = torch.cat([out_pred, in_pred], dim=0)
+        labels = torch.zeros(len(examples))
+        labels[: len(out_pred)] = 1
+        labels = labels.clone().detach().cpu()
+        examples = examples.clone().detach().cpu()
+        auroc = sk.roc_auc_score(labels, examples)
+        aupr = sk.average_precision_score(labels, examples)
+
+    if distributed:
+        aupr_auroc = {"device": torch.cuda.current_device(), "aupr": aupr, "auroc": auroc}
+        aupr_auroc_gather = [{"": ""} for _ in range(dist.get_world_size())]
+        dist.all_gather_object(aupr_auroc_gather, aupr_auroc)
+
+        def condition(x):
+            device, pr, roc = x["device"], x["aupr"], x["auroc"]
+            if pr > 0 and roc > 0:
+                return True
+            elif main_process:
+                logger.warning(
+                    f"DEVICE: {device} This batch does not contain any OOD pixels or is only OOD."
+                )
+                return False
+
+        aupr_auroc_valid = list(filter(condition, aupr_auroc_gather))
+        if len(aupr_auroc_valid) == 0:
+            aupr, auroc = -2, -2
+        else:
+            aupr = np.mean([x["aupr"] for x in aupr_auroc_valid])
+            auroc = np.mean([x["auroc"] for x in aupr_auroc_valid])
+
+    return aupr, auroc

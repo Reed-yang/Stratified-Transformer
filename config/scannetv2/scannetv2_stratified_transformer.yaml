@@ -43,7 +43,7 @@ TRAIN:
   warmup_ratio: 0.000001
   use_amp: True
   optimizer: AdamW #SGD
-  train_gpu: [0, 1, 2, 3] 
+  train_gpu: [1]
   workers: 16  # data loader workers
   batch_size: 8 # batch size for training
   batch_size_val: 4 # batch size for validation during training, memory and speed tradeoff
