@@ -61,8 +61,13 @@ def get_pseudo_label_msp(output):
     output = output.clone()
     output_softmax = torch.softmax(output, dim=-1)
     output_msp = output_softmax.max(dim=-1)[0]
+<<<<<<< HEAD
     # pseudo_label = output_msp < 0.7
     return output_msp
+=======
+    pseudo_label = output_msp < 0.7
+    return pseudo_label
+>>>>>>> e2bd8910591550a2151466bb4320b8c82300dc4e
 
 
 # def get_pseudo_label_msp(coord, batch, offset, output):
