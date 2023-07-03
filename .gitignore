@@ -93,3 +93,6 @@ output/*
 *.pth
 */__pycache__
 data/
+
+lib/
+util/
